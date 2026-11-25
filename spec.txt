@@ -1,0 +1,202 @@
+tpt-prism Design Specification (v2 — Formal Contracts)
+1. Executive Summary & Problem Solved
+The Problem: tpt-nova-render currently relies on wgpu for 3D rasterization. While functional, wgpu is fundamentally designed as a browser-safe WebGPU implementation. For a high-performance, vertically integrated game engine, it introduces unacceptable overhead:
+Supply Chain & License Risk: It pulls in naga (runtime shader compilation), ash/metal-rs/d3d12 (heavy FFI with build.rs scripts), and a deep tree of transitive dependencies that complicate strict MIT-only auditing.
+Runtime Validation Tax: wgpu spends thousands of lines of code dynamically validating every API call — checking buffer bounds, pipeline layout compatibility, render-pass state — to protect untrusted web content from crashing the browser.
+Runtime Shader Overhead: Runtime WGSL-to-SPIR-V/MSL compilation adds megabytes to the binary and latency to startup.
+API Mismatch: Implicit state tracking and browser-style error scopes are the wrong abstraction for a trusted, native engine.
+The Solution (tpt-prism): A strictly MIT-licensed, zero-build-script, graphics-first GPU rasterization substrate that replaces wgpu's runtime validation with formal contracts and type-state encoding. It strips away web-browser baggage, providing a bare-metal, safe-Rust abstraction for vertex processing, fragment shading, depth testing, and screen presentation — where safety is guaranteed by the type system and contract preconditions, not by runtime checks.
+2. Core Design Pillars
+2.1. The "Pure MIT" Chain
+tpt-prism will be licensed MIT-only.
+Dependency Policy: Enforced via cargo deny. Only MIT (and universally permissive exceptions like Unicode-DFS-2016) are permitted. Any crate requiring Apache-2.0 exclusively, or relying on C-compilers via build.rs, is rejected.
+2.2. Zero-Build-Script FFI
+We will not use bindgen in the CI/CD pipeline.
+FFI bindings for Vulkan (surface/swapchain extensions), Metal (CAMetalLayer), and DX12 (swapchain) will be generated locally on your machine.
+The resulting pure Rust .rs files will be committed directly to the repository.
+The build.rs file will be permanently deleted. This guarantees the crate compiles with pure cargo build and zero external C-toolchain requirements.
+2.3. Static Shader Pipeline (No naga)
+We will not ship a runtime shader compiler.
+Shaders are written in GLSL/HLSL offline.
+They are compiled to SPIR-V (Vulkan) and MSL (Metal) using standard offline tools (e.g., glslangValidator, dxc).
+The compiled binary bytes are embedded directly into the Rust code via include_bytes!.
+Result: Zero runtime compilation overhead, zero naga dependency, instant pipeline creation.
+2.4. Formal Contracts Over Runtime Validation (The Key Innovation)
+wgpu validates at runtime because it cannot trust its callers. tpt-prism can trust its callers (it is used only by tpt-nova, a known, trusted codebase), so we shift safety guarantees from runtime checks to compile-time and contract-time proofs.
+This eliminates thousands of lines of validation code while providing stronger safety guarantees than wgpu offers.
+2.4.1. Type-State Encoding
+Invalid state transitions are made unrepresentable at compile time. The Rust compiler formally proves correct usage — no runtime validation needed.
+// Command recording is a state machine enforced by the type system.
+pub struct CommandEncoder<State> {
+    raw: RawCommandBuffer,
+    _state: PhantomData<State>,
+}
+
+pub struct Idle;
+pub struct InRenderPass;
+pub struct InComputePass;
+
+// `draw` is only callable inside a render pass.
+// Calling it outside is a compile error, not a runtime panic.
+impl CommandEncoder<InRenderPass> {
+    pub fn draw(&mut self, vertices: u32, instances: u32) { ... }
+    pub fn draw_indexed(&mut self, indices: u32, instances: u32) { ... }
+    pub fn end(self) -> CommandEncoder<Idle> { ... }
+}
+
+// `begin_render_pass` is only callable when idle.
+impl CommandEncoder<Idle> {
+    pub fn begin_render_pass(self, desc: &RenderPassDesc) -> CommandEncoder<InRenderPass> { ... }
+    pub fn begin_compute_pass(self, desc: &ComputePassDesc) -> CommandEncoder<InComputePass> { ... }
+}
+
+Result: It is impossible to call draw() outside a render pass. The validation code wgpu uses to catch this mistake does not exist in tpt-prism.
+2.4.2. Contract-Based API (requires / ensures)
+For checks that cannot be encoded in the type system (e.g., buffer offset bounds), we use explicit preconditions and postconditions.
+
+/// Uploads `data` into `buffer` starting at `offset`.
+///
+/// # Contracts
+/// - requires: offset + data.len() <= buffer.capacity()
+/// - requires: offset % buffer.alignment() == 0
+/// - ensures: buffer.bytes()[offset..offset+data.len()] == data
+pub unsafe fn upload<T: Pod>(
+    buffer: &mut StorageBuffer,
+    offset: DeviceSize,
+    data: &[T],
+) {
+    debug_assert!(offset + size_of_val(data) <= buffer.capacity());
+    debug_assert!(offset % buffer.alignment() == 0);
+    // ... FFI call ...
+}
+
+In debug builds, these debug_assert! contracts catch bugs immediately.
+In --release builds, they compile to zero instructions. The contract is a formal specification, not a runtime tax.
+2.4.3. Bounded Model Checking for Unsafe Code
+For the most critical unsafe FFI boundaries (VRAM sub-allocator, command buffer submission), we run lightweight bounded model checkers in CI.
+Proof harnesses verify: "For any valid allocation request under X size, the sub-allocator never returns overlapping regions."
+The solver mathematically proves this holds for all inputs up to a defined bound.
+This replaces complex runtime heap-validation logic with mathematical certainty.
+2.4.4. What We Do NOT Verify
+To keep this maintainable as a solo developer:
+We do not formally verify the Vulkan or Metal specification. We trust the vendor's binary blob.
+We do not verify shader correctness. We trust the offline compiler (glslangValidator, dxc).
+We only verify the boundary between our safe Rust API and the unsafe FFI — the exact surface where bugs cause GPU hangs or memory corruption.
+2.5. Explicit Over Implicit State
+wgpu tracks massive amounts of render state to protect web browsers from invalid API calls. tpt-prism will not.
+State (viewport, scissor, blend mode, depth write) is bound explicitly via the GraphicsPipeline object.
+No hidden frame pacing or automatic window-resizing logic. The engine (tpt-nova) controls the lifecycle explicitly.
+3. Architecture & Module Breakdown
+tpt-prism will be a single, cohesive crate (or a tightly coupled workspace) that builds upon the foundational FFI of tpt-matrix-core.
+3.1. tpt-prism-surface (Platform Integration)
+Role: Abstracts OS-specific window/surface creation and frame presentation.
+Key Types:
+Surface: Represents a renderable OS window (wraps HWND, X11/Wayland surface, or CAMetalLayer).
+Swapchain: Manages the chain of images presented to the screen.
+PresentMode: VSync, Immediate, Mailbox.
+Contract: Swapchain::acquire_next_image() returns an ImageIndex that is formally guaranteed to be within the swapchain's image count.
+3.2. tpt-prism-pipeline (Graphics State)
+Role: Defines the fixed-function and programmable graphics pipeline.
+Key Types:
+GraphicsPipeline: Bundles Vertex Input State, Rasterization State, Depth/Stencil State, and Color Blend State.
+RenderPass: Defines attachment descriptions and subpass dependencies.
+Framebuffer: Binds specific ImageView resources to a RenderPass.
+Contract: A GraphicsPipeline is formally bound to a specific RenderPass at creation time. Attempting to use it in a different render pass is a compile-time error (enforced via type-state).
+3.3. tpt-prism-command (Recording & Execution)
+Role: Records and submits graphics commands to the GPU queue (managed by tpt-matrix).
+Key Commands:
+begin_render_pass / end_render_pass (state transitions via type-state)
+bind_pipeline
+bind_vertex_buffer / bind_index_buffer
+draw / draw_indexed
+Design: A lightweight, safe wrapper around native command buffers. Validation is replaced by type-state and contracts.
+3.4. tpt-prism-image (Textures & Sampling)
+Role: Manages 2D/3D images and how they are read in shaders.
+Key Types:
+Texture: GPU memory allocation for image data (supports mipmaps, standard formats).
+ImageView: A specific view into a Texture (e.g., a specific mip level or array layer).
+Sampler: Defines filtering and wrapping behavior.
+Contract: ImageView creation is formally constrained to valid sub-ranges of the parent Texture (mip levels, array layers). Invalid ranges are rejected at construction.
+3.5. tpt-prism-contracts (Formal Specification Layer)
+Role: Centralizes all contract definitions, type-state transitions, and proof harnesses.
+Key Contents:
+Type-state definitions for command recording.
+requires / ensures annotations on all unsafe FFI boundaries.
+Bounded model checking harnesses for the VRAM sub-allocator and command submission.
+Design: This module is the "formal core" of tpt-prism. It is heavily tested and verified, while the rest of the crate is a thin, safe wrapper around it.
+4. What is Explicitly EXCLUDED (v1.0 Scope)
+To ensure this is buildable and maintainable by a solo developer, the following are strictly out of scope for v1.0:
+Ray Tracing: No acceleration structures, ray pipelines, or shader binding tables.
+Mesh Shaders / Task Shaders: Stick to traditional Vertex and Fragment shaders.
+Tessellation & Geometry Shaders: Deprecated, slow, and unnecessary for tpt-nova's target use cases.
+Dynamic Rendering: No VK_KHR_dynamic_rendering. Use traditional, explicit RenderPass and Framebuffer objects.
+Advanced Blending: No dual-source blending or logic ops. Standard alpha blending (SourceOver) is sufficient.
+Multi-GPU / Explicit Multi-Adapter: Single GPU context only.
+Full Formal Verification of the GPU Driver: We trust the vendor's binary blob. We only verify our own API boundary.
+5. Integration with the TPT Ecosystem
+tpt-prism does not work in isolation. It is the final visual step in a highly optimized, vertically integrated pipeline:
+tpt-kinetix decodes a video stream or loads a .spls Gaussian splat file into CPU memory (pure Rust, safe, fast).
+tpt-matrix takes that CPU data, allocates a GPU Texture or StorageBuffer via its VRAM sub-allocator, and performs a zero-copy upload. It can also run compute shaders to pre-process the data (e.g., splat sorting).
+tpt-prism binds that Texture/Buffer, executes the GraphicsPipeline (vertex transformation, fragment sampling, depth testing), and calls Swapchain::present() to display the frame.
+tpt-raster (CPU-side) handles any 2D UI compositing (e.g., egui overlays) that needs to be blended on top, or provides deterministic fallbacks if the GPU is unavailable.
+The formal contracts ensure that data flowing between these crates is always valid — buffer offsets are correct, pipeline layouts match, and render passes are properly scoped — without any runtime validation overhead.
+6. Implementation Roadmap (Solo Maintainer Track)
+Phase 1: Surface & Swapchain (Weeks 1-4)
+Generate pure Rust FFI for Vulkan surface/swapchain, Metal CAMetalLayer, and DX12 swapchain.
+Implement Surface creation and Swapchain initialization.
+Define type-state contracts for swapchain lifecycle (Acquired → Rendered → Presented).
+Milestone: Open a window and clear the screen to a solid color at 60fps.
+Phase 2: Pipeline & Command Recording (Weeks 5-8)
+Implement RenderPass and Framebuffer creation.
+Implement GraphicsPipeline creation (hardcoded vertex/fragment SPIR-V/MSL via include_bytes!).
+Implement CommandBuffer recording with type-state encoding (Idle → InRenderPass → Idle).
+Write bounded model checking harnesses for command buffer submission.
+Milestone: Render a static, untextured, colored triangle to the screen.
+Phase 3: Textures & Samplers (Weeks 9-12)
+Implement Texture allocation and ImageView creation.
+Implement Sampler states (linear filtering, clamp-to-edge).
+Implement CPU-to-GPU texture upload (bridging with tpt-matrix memory).
+Add requires/ensures contracts for all texture upload operations.
+Milestone: Render a textured 2D quad (e.g., a PNG loaded from disk).
+Phase 4: Depth, Stencil & Indexing (Weeks 13-16)
+Add Depth/Stencil state to GraphicsPipeline.
+Implement bind_index_buffer and draw_indexed.
+Implement basic uniform buffer updates (for MVP matrices).
+Run full bounded model checking pass on the VRAM sub-allocator.
+Milestone: Render a rotating, depth-tested, textured 3D cube.
+Phase 5: tpt-nova-render Migration (Weeks 17-24)
+Create a feature flag in tpt-nova-render to swap wgpu for tpt-prism + tpt-matrix.
+Port the PBR and Sprite pipelines to use pre-compiled shaders and tpt-prism APIs.
+Benchmark startup time and binary size against wgpu to validate the wins.
+Milestone: tpt-nova runs entirely on the pure-MIT, zero-build-script, formally-contracted TPT GPU stack.
+7. Strict License Enforcement (deny.toml)
+To guarantee the pure MIT chain, the repository root will include this exact configuration for cargo-deny:
+
+[licenses]
+# We ONLY allow MIT. No Apache, no BSD, no viral licenses.
+allow = [
+    "MIT",
+    "Unicode-DFS-2016" # (Often required by stdlib/unicode crates, strictly permissive)
+]
+
+# Explicitly ban Apache-2.0 to enforce your pure-MIT rule
+deny = [
+    "Apache-2.0",
+    "GPL-2.0",
+    "GPL-3.0",
+    "AGPL-3.0"
+]
+
+# If a crate is dual-licensed (e.g., MIT OR Apache-2.0), 
+# cargo-deny will accept it because MIT is in the allow list.
+# But we will actively avoid crates that are Apache-only.
+
+8. The Formal Verification Advantage
+By replacing runtime validation with formal contracts, tpt-prism achieves three critical wins over wgpu:
+Zero-Cost Safety: In --release builds, contracts compile to zero instructions. You get mathematical certainty without any runtime tax.
+Compile-Time Error Detection: Type-state encoding catches invalid API usage at compile time, not at runtime. Bugs are found during development, not in production.
+Drastically Smaller Codebase: wgpu's validation layer is thousands of lines of code. tpt-prism's contract layer is a few hundred lines of type definitions and debug_assert! statements. This makes it maintainable by a solo developer.
+The result is a GPU rasterization substrate that is safer than wgpu (because it uses formal proofs instead of runtime checks), faster than wgpu (because it has zero validation overhead), and smaller than wgpu (because it strips out all the browser-security baggage).
+Summary
+tpt-prism solves the rendering bloat, supply-chain risk, and validation overhead of wgpu in tpt-nova. By replacing runtime validation with formal contracts and type-state encoding, you reduce the problem from "reimplementing WebGPU" to "building a minimal, formally-specified rasterization dispatcher."
+Paired with tpt-matrix (compute), tpt-raster (CPU 2D), and tpt-kinetix (media I/O), this gives you a complete, vertically integrated, pure-MIT graphics stack where every single crate has a single, well-defined, and maintainable responsibility — and where safety is guaranteed by the type system and mathematical proofs, not by runtime checks.

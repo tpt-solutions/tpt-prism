@@ -1,0 +1,34 @@
+# Rust build output
+/target/
+**/target/
+
+# Backup and temporary files
+*.rs.bk
+*.tmp
+*.swp
+*~
+
+# Editor and IDE settings
+.vscode/
+.idea/
+*.iml
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local environment and secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# Compiled shader outputs are committed on purpose (see todo.md Phase 2).
+# Only ignore intermediate files produced by the offline shader tools.
+*.spv.tmp
+*.dxil.tmp
